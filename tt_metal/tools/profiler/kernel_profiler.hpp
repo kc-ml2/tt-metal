@@ -75,12 +75,15 @@ constexpr uint32_t DISPATCH_HEADROOM_SIZE =
 
 constexpr int WALL_CLOCK_HIGH_INDEX = 1;
 constexpr int WALL_CLOCK_LOW_INDEX = 0;
+constexpr uint32_t DEBUG_WALL_CLOCK_SAMPLE_COUNT = 4;
 
 volatile tt_l1_ptr uint32_t* profiler_control_buffer =
     reinterpret_cast<volatile tt_l1_ptr uint32_t*>(GET_MAILBOX_ADDRESS_DEV(profiler.control_vector));
 
 volatile tt_l1_ptr profiler_msg_buffer_t* profiler_data_buffer =
     reinterpret_cast<volatile tt_l1_ptr profiler_msg_buffer_t*>(GET_MAILBOX_ADDRESS_DEV(profiler.buffer));
+
+uint32_t debug_wall_clock_samples_written = 0;
 
 #if (PROFILE_KERNEL & PROFILER_OPT_DO_TRACE_ONLY)
 constexpr uint32_t myRiscID = 0;
@@ -161,6 +164,12 @@ inline __attribute__((always_inline)) uint32_t get_id(uint32_t id, PacketTypes t
     return ((id & 0xFFFF) | ((type << 16) & 0x7FFFF));
 }
 
+inline __attribute__((always_inline)) bool debug_wall_clock_core() {
+    const uint32_t flat_id = profiler_control_buffer[FLAT_ID] & 0xFF;
+    return flat_id == 55 || flat_id == 63 || flat_id == 64 || flat_id == 68 || flat_id == 76 || flat_id == 77 ||
+           flat_id == 79 || flat_id == 87 || flat_id == 88;
+}
+
 template <DoingDispatch dispatch = DoingDispatch::NOT_DISPATCH>
 inline __attribute__((always_inline)) bool bufferHasRoom(uint32_t additional_slots = 0) {
     bool bufferHasRoom = false;
@@ -175,11 +184,41 @@ inline __attribute__((always_inline)) bool bufferHasRoom(uint32_t additional_slo
     return bufferHasRoom;
 }
 
+inline __attribute__((always_inline)) void append_debug_wall_clock_sample(volatile tt_reg_ptr uint32_t* p_reg) {
+    constexpr uint32_t debug_sample_slots = 2 * (2 * PROFILER_L1_MARKER_UINT32_SIZE);
+    if (debug_wall_clock_samples_written >= DEBUG_WALL_CLOCK_SAMPLE_COUNT || !debug_wall_clock_core() ||
+        wIndex + debug_sample_slots >= PROFILER_L1_VECTOR_SIZE) {
+        return;
+    }
+
+    const uint32_t wall0 = p_reg[WALL_CLOCK_LOW_INDEX];
+    const uint32_t wall1 = p_reg[WALL_CLOCK_HIGH_INDEX];
+    const uint32_t wall1_at = *reinterpret_cast<volatile tt_reg_ptr uint32_t*>(RISCV_DEBUG_REG_WALL_CLOCK_H);
+    const uint32_t flat_id = profiler_control_buffer[FLAT_ID] & 0xFF;
+    const uint32_t x = profiler_control_buffer[NOC_X] & 0xFF;
+    const uint32_t y = profiler_control_buffer[NOC_Y] & 0xFF;
+    const uint32_t packed_core = (x << 24) | (y << 16) | (flat_id << 8) | (myRiscID & 0xFF);
+    debug_wall_clock_samples_written++;
+
+    profiler_data_buffer[myRiscID].data[wIndex++] =
+        0x80000000 | ((get_id(DEBUG_WALL_CLOCK_01_STATIC_ID, TS_DATA) & 0x7FFFF) << 12) | (wall1 & 0xFFF);
+    profiler_data_buffer[myRiscID].data[wIndex++] = wall0;
+    profiler_data_buffer[myRiscID].data[wIndex++] = wall0;
+    profiler_data_buffer[myRiscID].data[wIndex++] = wall1;
+
+    profiler_data_buffer[myRiscID].data[wIndex++] =
+        0x80000000 | ((get_id(DEBUG_WALL_CLOCK_1AT_STATIC_ID, TS_DATA) & 0x7FFFF) << 12) | (wall1 & 0xFFF);
+    profiler_data_buffer[myRiscID].data[wIndex++] = wall0;
+    profiler_data_buffer[myRiscID].data[wIndex++] = wall1_at;
+    profiler_data_buffer[myRiscID].data[wIndex++] = packed_core;
+}
+
 inline __attribute__((always_inline)) void mark_time_at_index_inlined(uint32_t index, uint32_t timer_id) {
     volatile tt_reg_ptr uint32_t* p_reg = reinterpret_cast<volatile tt_reg_ptr uint32_t*>(RISCV_DEBUG_REG_WALL_CLOCK_L);
     profiler_data_buffer[myRiscID].data[index] =
         0x80000000 | ((timer_id & 0x7FFFF) << 12) | (p_reg[WALL_CLOCK_HIGH_INDEX] & 0xFFF);
     profiler_data_buffer[myRiscID].data[index + 1] = p_reg[WALL_CLOCK_LOW_INDEX];
+    append_debug_wall_clock_sample(p_reg);
 }
 
 inline __attribute__((always_inline)) void mark_padding() {

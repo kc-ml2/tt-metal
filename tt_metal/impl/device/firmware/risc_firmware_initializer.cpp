@@ -5,9 +5,11 @@
 #include "risc_firmware_initializer.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <future>
 #include <set>
+#include <string_view>
 
 #include <enchantum/enchantum.hpp>
 #include <tracy/Tracy.hpp>
@@ -38,6 +40,73 @@
 #include <umd/device/types/cluster_descriptor_types.hpp>
 
 namespace tt::tt_metal {
+
+namespace {
+
+bool firmwareProfilerDebugX11Enabled() {
+    const char* value = std::getenv("TT_METAL_PROFILER_DEBUG_X11");
+    return value != nullptr && std::string_view(value) != "0" && std::string_view(value) != "false";
+}
+
+bool firmwareProfilerDebugX11Core(const CoreCoord& phys_core) {
+    return (phys_core.x == 6 || phys_core.x == 11 || phys_core.x == 12) &&
+           (phys_core.y == 2 || phys_core.y == 10 || phys_core.y == 11);
+}
+
+void logFirmwareDebugX11WallClock(
+    const Cluster& cluster, tt::ChipId device_id, const CoreCoord& virtual_core, std::string_view phase) {
+    if (!firmwareProfilerDebugX11Enabled()) {
+        return;
+    }
+
+    const auto& soc_desc = cluster.get_soc_desc(device_id);
+    const CoreCoord phys_core = soc_desc.translate_coord_to(virtual_core, CoordSystem::TRANSLATED, CoordSystem::NOC0);
+    if (!firmwareProfilerDebugX11Core(phys_core)) {
+        return;
+    }
+
+    constexpr uint64_t wall_clock_0_addr = 0xFFB121F0;
+    constexpr uint64_t wall_clock_1_addr = 0xFFB121F4;
+    constexpr uint64_t wall_clock_1_at_addr = 0xFFB121F8;
+    uint32_t wall0 = 0;
+    uint32_t wall1 = 0;
+    uint32_t wall1_at = 0;
+    cluster.read_reg(&wall0, tt_cxy_pair(device_id, virtual_core), wall_clock_0_addr);
+    cluster.read_reg(&wall1, tt_cxy_pair(device_id, virtual_core), wall_clock_1_addr);
+    cluster.read_reg(&wall1_at, tt_cxy_pair(device_id, virtual_core), wall_clock_1_at_addr);
+    log_info(
+        LogDevice,
+        "PROFILER_DEBUG_X11 fw_reset_clock phase={} dev={} virtual=({},{}) physical=({},{}) wall0_low=0x{:08x} "
+        "wall1_raw=0x{:08x} wall1_at=0x{:08x}",
+        phase,
+        device_id,
+        virtual_core.x,
+        virtual_core.y,
+        phys_core.x,
+        phys_core.y,
+        wall0,
+        wall1,
+        wall1_at);
+}
+
+void logFirmwareDebugX11WallClockAtPhysicalSampleCores(
+    const Cluster& cluster, tt::ChipId device_id, std::string_view phase) {
+    if (!firmwareProfilerDebugX11Enabled()) {
+        return;
+    }
+
+    const auto& soc_desc = cluster.get_soc_desc(device_id);
+    for (uint32_t physical_y : {2u, 10u, 11u}) {
+        for (uint32_t physical_x : {6u, 11u, 12u}) {
+            const CoreCoord physical_core(physical_x, physical_y);
+            const CoreCoord virtual_core =
+                soc_desc.translate_coord_to(physical_core, CoordSystem::NOC0, CoordSystem::TRANSLATED);
+            logFirmwareDebugX11WallClock(cluster, device_id, virtual_core, phase);
+        }
+    }
+}
+
+}  // namespace
 
 RiscFirmwareInitializer::RiscFirmwareInitializer(
     std::shared_ptr<const ContextDescriptor> descriptor,
@@ -113,6 +182,7 @@ void RiscFirmwareInitializer::run_async_build_phase(const std::set<tt::ChipId>& 
     for (auto refs : table_refs) {
         futures.emplace_back(detail::async([this, refs]() {
             tt::ChipId device_id = refs.device_id;
+            logFirmwareDebugX11WallClockAtPhysicalSampleCores(cluster_, device_id, "fw_async_build_phase_entry");
             // Clear L1/DRAM if requested - skip for mock devices (no memory), but do for emulated (memory-backed)
             if (cluster_.get_target_device_type() != tt::TargetDevice::Mock) {
                 if (rtoptions_.get_clear_l1()) {
@@ -147,6 +217,7 @@ void RiscFirmwareInitializer::run_async_build_phase(const std::set<tt::ChipId>& 
                 // run in this case, causing UMD issued transactions to hang.
                 clear_launch_messages_on_eth_cores(device_id);
             }
+            logFirmwareDebugX11WallClockAtPhysicalSampleCores(cluster_, device_id, "fw_async_build_phase_done");
         }));
     }
 
@@ -163,9 +234,15 @@ void RiscFirmwareInitializer::run_launch_phase(const std::set<tt::ChipId>& devic
         terminate_active_ethernet_cores_on_all_chips();
 
         for (tt::ChipId device_id : device_ids) {
+            logFirmwareDebugX11WallClockAtPhysicalSampleCores(cluster_, device_id, "fw_launch_phase_before_clear_noc");
             ClearNocData(descriptor_->env_impl(), device_id);
+            logFirmwareDebugX11WallClockAtPhysicalSampleCores(
+                cluster_, device_id, "fw_launch_phase_before_reset_cores");
             reset_cores(device_id);
+            logFirmwareDebugX11WallClockAtPhysicalSampleCores(cluster_, device_id, "fw_launch_phase_after_reset_cores");
             initialize_and_launch_firmware(device_id);
+            logFirmwareDebugX11WallClockAtPhysicalSampleCores(
+                cluster_, device_id, "fw_launch_phase_after_firmware_init");
         }
     }
     initialized_ = true;
@@ -321,7 +398,9 @@ void RiscFirmwareInitializer::assert_tensix_workers_impl(tt::ChipId device_id) {
             CoreCoord logical_core(x, y);
             CoreCoord worker_core =
                 cluster_.get_virtual_coordinate_from_logical_coordinates(device_id, logical_core, CoreType::WORKER);
+            logFirmwareDebugX11WallClock(cluster_, device_id, worker_core, "before_assert");
             cluster_.assert_risc_reset_at_core(tt_cxy_pair(device_id, worker_core), tt::umd::RiscType::ALL);
+            logFirmwareDebugX11WallClock(cluster_, device_id, worker_core, "after_assert");
         }
     }
 }
@@ -380,6 +459,7 @@ void RiscFirmwareInitializer::terminate_active_ethernet_cores_on_all_chips() {
 void RiscFirmwareInitializer::reset_cores(tt::ChipId device_id) {
     ZoneScoped;
     std::unordered_map<tt::ChipId, std::unordered_set<CoreCoord>> device_to_early_exit_cores;
+    logFirmwareDebugX11WallClockAtPhysicalSampleCores(cluster_, device_id, "reset_cores_entry");
 
     if (has_flag(descriptor_->fabric_manager(), tt_fabric::FabricManagerMode::INIT_FABRIC)) {
         if (hal_.get_eth_fw_is_cooperative()) {
@@ -417,12 +497,15 @@ void RiscFirmwareInitializer::reset_cores(tt::ChipId device_id) {
         }
     }
 
+    logFirmwareDebugX11WallClockAtPhysicalSampleCores(cluster_, device_id, "reset_cores_before_assert_tensix_workers");
     assert_tensix_workers_impl(device_id);
+    logFirmwareDebugX11WallClockAtPhysicalSampleCores(cluster_, device_id, "reset_cores_after_assert_tensix_workers");
     assert_dram_cores(device_id);
     if (has_flag(descriptor_->fabric_manager(), tt_fabric::FabricManagerMode::INIT_FABRIC)) {
         assert_inactive_ethernet_cores(device_id);
     }
     cluster_.l1_barrier(device_id);
+    logFirmwareDebugX11WallClockAtPhysicalSampleCores(cluster_, device_id, "reset_cores_after_l1_barrier");
 }
 
 void RiscFirmwareInitializer::assert_cores(tt::ChipId device_id) {
@@ -1112,6 +1195,7 @@ void RiscFirmwareInitializer::initialize_firmware(
 void RiscFirmwareInitializer::initialize_and_launch_firmware(tt::ChipId device_id) {
     ZoneScoped;
 
+    logFirmwareDebugX11WallClockAtPhysicalSampleCores(cluster_, device_id, "initialize_firmware_entry");
     log_debug(tt::LogMetal, "Initializing worker cores");
     std::unordered_set<CoreCoord> not_done_cores;
     CoreCoord logical_grid_size = cluster_.get_soc_desc(device_id).get_grid_size(CoreType::TENSIX);
@@ -1238,6 +1322,7 @@ void RiscFirmwareInitializer::initialize_and_launch_firmware(tt::ChipId device_i
     }
 
     cluster_.l1_barrier(device_id);
+    logFirmwareDebugX11WallClockAtPhysicalSampleCores(cluster_, device_id, "initialize_firmware_before_deassert");
 
     for (const auto& worker_core : not_done_cores) {
         if (multi_risc_active_eth_cores.contains(worker_core) && rtoptions_.get_enable_2_erisc_mode()) {
@@ -1253,11 +1338,14 @@ void RiscFirmwareInitializer::initialize_and_launch_firmware(tt::ChipId device_i
                 reset_val |= tt::umd::RiscType::ERISC1;
             }
         }
+        logFirmwareDebugX11WallClock(cluster_, device_id, worker_core, "before_deassert");
         cluster_.deassert_risc_reset_at_core(tt_cxy_pair(device_id, worker_core), reset_val);
+        logFirmwareDebugX11WallClock(cluster_, device_id, worker_core, "after_deassert");
     }
     for (const auto& dram_core : dram_not_done_cores) {
         cluster_.deassert_risc_reset_at_core(tt_cxy_pair(device_id, dram_core), tt::umd::RiscType::BRISC);
     }
+    logFirmwareDebugX11WallClockAtPhysicalSampleCores(cluster_, device_id, "initialize_firmware_after_deassert");
 
     log_debug(LogDevice, "Waiting for firmware init complete");
     const int timeout_ms = 10000;
@@ -1267,6 +1355,7 @@ void RiscFirmwareInitializer::initialize_and_launch_firmware(tt::ChipId device_i
         TT_THROW("Device {} init: failed to initialize FW! Try resetting the board.", device_id);
     }
     log_debug(LogDevice, "Firmware init complete");
+    logFirmwareDebugX11WallClockAtPhysicalSampleCores(cluster_, device_id, "initialize_firmware_done");
 
     if (!dram_not_done_cores.empty()) {
         log_debug(LogDevice, "Waiting for DRAM firmware init complete");

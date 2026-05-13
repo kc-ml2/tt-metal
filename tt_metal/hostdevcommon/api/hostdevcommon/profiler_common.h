@@ -19,6 +19,8 @@ static constexpr uint32_t DRAM_PROFILER_ADDRESS_STALLED = 0xFFFFFFFF;
 // also must fit in 16 bits (timer_id & 0xFFFF)
 static constexpr uint32_t NOC_TRACING_STATIC_ID = 12345;
 static constexpr uint32_t NOC_DEBUGGING_STATIC_ID = 23456;
+static constexpr uint32_t DEBUG_WALL_CLOCK_01_STATIC_ID = 32001;
+static constexpr uint32_t DEBUG_WALL_CLOCK_1AT_STATIC_ID = 32002;
 
 enum BufferIndex {
     ID_HH,

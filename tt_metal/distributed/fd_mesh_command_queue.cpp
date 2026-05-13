@@ -14,9 +14,11 @@
 #include <tt-metalium/tt_metal.hpp>
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <optional>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 
@@ -63,6 +65,66 @@ struct ProgramCommandSequence;
 namespace tt::tt_metal::distributed {
 
 namespace {
+
+bool profiler_debug_x11_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("TT_METAL_PROFILER_DEBUG_X11");
+        return value != nullptr && std::string_view(value) != "0";
+    }();
+    return enabled;
+}
+
+void log_profiler_debug_x11_fd_clocks(
+    ContextId context_id, IDevice* device, std::string_view phase, uint8_t cq_id, bool reset_launch_msg_state) {
+    if (!profiler_debug_x11_enabled()) {
+        return;
+    }
+
+    static constexpr uint64_t wall_clock_0_addr = 0xFFB121F0;
+    static constexpr uint64_t wall_clock_1_addr = 0xFFB121F4;
+    static constexpr uint64_t wall_clock_1_at_addr = 0xFFB121F8;
+    static constexpr std::array<CoreCoord, 9> suspect_virtual_cores = {
+        CoreCoord{6, 2},
+        CoreCoord{7, 2},
+        CoreCoord{10, 2},
+        CoreCoord{6, 10},
+        CoreCoord{7, 10},
+        CoreCoord{10, 10},
+        CoreCoord{6, 11},
+        CoreCoord{7, 11},
+        CoreCoord{10, 11},
+    };
+
+    auto& cluster = MetalContext::instance(context_id).get_cluster();
+    const ChipId device_id = device->id();
+    const auto& virtual_worker_cores = cluster.get_virtual_worker_cores(device_id);
+    for (const CoreCoord& virtual_core : suspect_virtual_cores) {
+        if (!virtual_worker_cores.contains(virtual_core)) {
+            continue;
+        }
+
+        uint32_t wall0 = 0;
+        uint32_t wall1 = 0;
+        uint32_t wall1_at = 0;
+        cluster.read_reg(&wall0, tt_cxy_pair(device_id, virtual_core), wall_clock_0_addr);
+        cluster.read_reg(&wall1, tt_cxy_pair(device_id, virtual_core), wall_clock_1_addr);
+        cluster.read_reg(&wall1_at, tt_cxy_pair(device_id, virtual_core), wall_clock_1_at_addr);
+
+        log_info(
+            LogMetal,
+            "PROFILER_DEBUG_X11 fd_clock phase={} device={} cq={} reset_launch={} translated=({}, {}) "
+            "wall0=0x{:08x} wall1=0x{:08x} wall1_at=0x{:08x}",
+            phase,
+            device_id,
+            cq_id,
+            reset_launch_msg_state,
+            virtual_core.x,
+            virtual_core.y,
+            wall0,
+            wall1,
+            wall1_at);
+    }
+}
 
 // Don't use std::forward since we are in a loop.
 // NOLINTBEGIN(cppcoreguidelines-missing-std-forward)
@@ -272,6 +334,10 @@ void FDMeshCommandQueue::enqueue_mesh_workload(MeshWorkload& mesh_workload, bool
     TT_FATAL(sub_device_ids.size() == 1, "Programs must be executed on a single sub-device");
     SubDeviceId sub_device_id = *(sub_device_ids.begin());
     auto mesh_device_id = mesh_device_->id();
+    for (auto* device : mesh_device_->get_devices()) {
+        log_profiler_debug_x11_fd_clocks(
+            mesh_device_->impl().get_context_id(), device, "enqueue_entry", id_, /*reset_launch_msg_state=*/false);
+    }
     auto& sysmem_manager = this->reference_sysmem_manager();
     auto dispatch_core_config = MetalContext::instance(this->device()->impl().get_context_id())
                                     .get_dispatch_core_manager()
@@ -347,10 +413,26 @@ void FDMeshCommandQueue::enqueue_mesh_workload(MeshWorkload& mesh_workload, bool
 
     // Need to stall and reset counters if host wraps
     if (updated_worker_counts.wrapped) [[unlikely]] {
+        for (auto* device : mesh_device_->get_devices()) {
+            log_profiler_debug_x11_fd_clocks(
+                mesh_device_->impl().get_context_id(),
+                device,
+                "before_completion_counter_wrap_reset",
+                id_,
+                /*reset_launch_msg_state=*/false);
+        }
         get_config_buffer_mgr(*sub_device_id).mark_completely_full(0);
         for (auto* device : mesh_device_->get_devices()) {
             program_dispatch::reset_expected_num_workers_completed_on_device(
                 device, sub_device_id, expected_num_workers_completed, id());
+        }
+        for (auto* device : mesh_device_->get_devices()) {
+            log_profiler_debug_x11_fd_clocks(
+                mesh_device_->impl().get_context_id(),
+                device,
+                "after_completion_counter_wrap_reset",
+                id_,
+                /*reset_launch_msg_state=*/false);
         }
     }
 
@@ -411,6 +493,16 @@ void FDMeshCommandQueue::enqueue_mesh_workload(MeshWorkload& mesh_workload, bool
             mesh_workload.impl().get_program_binary_status(mesh_device_id),
             std::pair<bool, int>(unicast_go_signals, num_virtual_eth_cores));
 
+        for_each_local(mesh_device_, device_range, [&](const auto& coord) {
+            auto device = mesh_device_->impl().get_device(coord);
+            log_profiler_debug_x11_fd_clocks(
+                mesh_device_->impl().get_context_id(),
+                device,
+                "after_update_program_dispatch_commands",
+                id_,
+                /*reset_launch_msg_state=*/false);
+        });
+
         this->write_program_cmds_to_subgrid(
             device_range,
             program_cmd_seq,
@@ -427,12 +519,28 @@ void FDMeshCommandQueue::enqueue_mesh_workload(MeshWorkload& mesh_workload, bool
         mcast_go_signals,
         unicast_go_signals,
         dispatch_metadata);
+    for (auto* device : mesh_device_->get_devices()) {
+        log_profiler_debug_x11_fd_clocks(
+            mesh_device_->impl().get_context_id(),
+            device,
+            "after_go_signal_unused_grids",
+            id_,
+            /*reset_launch_msg_state=*/false);
+    }
     // Increment Launch Message Buffer Write Pointers
     if (mcast_go_signals) {
         cq_shared_state_->worker_launch_message_buffer_state[*sub_device_id].inc_mcast_wptr(1);
     }
     if (unicast_go_signals) {
         cq_shared_state_->worker_launch_message_buffer_state[*sub_device_id].inc_unicast_wptr(1);
+    }
+    for (auto* device : mesh_device_->get_devices()) {
+        log_profiler_debug_x11_fd_clocks(
+            mesh_device_->impl().get_context_id(),
+            device,
+            "after_launch_wptr_increment",
+            id_,
+            /*reset_launch_msg_state=*/false);
     }
     // From the dispatcher's perspective, binaries are now committed to DRAM
     mesh_workload.impl().set_program_binary_status(mesh_device_id, ProgramBinaryStatus::Committed);
@@ -533,14 +641,38 @@ void FDMeshCommandQueue::finish_nolock(tt::stl::Span<const SubDeviceId> sub_devi
         return;
     }
 
+    for (auto* device : mesh_device_->get_devices()) {
+        log_profiler_debug_x11_fd_clocks(
+            mesh_device_->impl().get_context_id(), device, "finish_entry", id_, /*reset_launch_msg_state=*/false);
+    }
     auto event = this->enqueue_record_event_to_host_nolock(sub_device_ids);
+    for (auto* device : mesh_device_->get_devices()) {
+        log_profiler_debug_x11_fd_clocks(
+            mesh_device_->impl().get_context_id(),
+            device,
+            "finish_after_record_event",
+            id_,
+            /*reset_launch_msg_state=*/false);
+    }
 
     std::unique_lock<std::mutex> lock(reads_processed_cv_mutex_);
     reads_processed_cv_.wait(
         lock, [this] { return num_outstanding_reads_.load() == 0 || thread_exception_state_.load(); });
+    for (auto* device : mesh_device_->get_devices()) {
+        log_profiler_debug_x11_fd_clocks(
+            mesh_device_->impl().get_context_id(),
+            device,
+            "finish_after_reads_processed",
+            id_,
+            /*reset_launch_msg_state=*/false);
+    }
     auto& sub_device_cq_owner = cq_shared_state_->sub_device_cq_owner;
     for (const auto& sub_device_id : buffer_dispatch::select_sub_device_ids(mesh_device_, sub_device_ids)) {
         sub_device_cq_owner[*sub_device_id].finished(this->id_);
+    }
+    for (auto* device : mesh_device_->get_devices()) {
+        log_profiler_debug_x11_fd_clocks(
+            mesh_device_->impl().get_context_id(), device, "finish_done", id_, /*reset_launch_msg_state=*/false);
     }
 
     if (should_handle_exception_.load()) {
@@ -945,12 +1077,24 @@ void FDMeshCommandQueue::reset_worker_state(
     cq_shared_state_->sub_device_cq_owner.resize(num_sub_devices);
     in_use_ = true;
     for (auto* device : mesh_device_->get_devices()) {
+        log_profiler_debug_x11_fd_clocks(
+            mesh_device_->impl().get_context_id(),
+            device,
+            "reset_worker_state_before_reset_read_ptr_enqueue",
+            id_,
+            reset_launch_msg_state);
         program_dispatch::reset_worker_dispatch_state_on_device(
             mesh_device_,
             device->sysmem_manager(),
             id_,
             this->virtual_program_dispatch_core(),
             expected_num_workers_completed_,
+            reset_launch_msg_state);
+        log_profiler_debug_x11_fd_clocks(
+            mesh_device_->impl().get_context_id(),
+            device,
+            "reset_worker_state_after_reset_read_ptr_enqueue",
+            id_,
             reset_launch_msg_state);
         program_dispatch::set_num_worker_sems_on_dispatch(mesh_device_, device->sysmem_manager(), id_, num_sub_devices);
         program_dispatch::set_go_signal_noc_data_on_dispatch(
@@ -987,9 +1131,27 @@ void FDMeshCommandQueue::write_program_cmds_to_subgrid(
     CoreType dispatch_core_type = get_core_type_from_config(dispatch_core_config);
     for_each_local(mesh_device_, sub_grid, [&](const auto& coord) {
         auto device = mesh_device_->impl().get_device(coord);
+        log_profiler_debug_x11_fd_clocks(
+            mesh_device_->impl().get_context_id(),
+            device,
+            "before_update_launch_messages_for_profiler",
+            id_,
+            /*reset_launch_msg_state=*/false);
         this->update_launch_messages_for_device_profiler(program_cmd_seq, program_runtime_id, device);
+        log_profiler_debug_x11_fd_clocks(
+            mesh_device_->impl().get_context_id(),
+            device,
+            "before_write_program_cmd_seq",
+            id_,
+            /*reset_launch_msg_state=*/false);
         program_dispatch::write_program_command_sequence(
             program_cmd_seq, device->sysmem_manager(), id_, dispatch_core_type, stall_first, stall_before_program);
+        log_profiler_debug_x11_fd_clocks(
+            mesh_device_->impl().get_context_id(),
+            device,
+            "after_write_program_cmd_seq",
+            id_,
+            /*reset_launch_msg_state=*/false);
         chip_ids_in_workload.insert(device->id());
     });
 }
@@ -1474,12 +1636,24 @@ void FDMeshCommandQueue::wait_for_completion(bool reset_launch_msg_state) {
         cq_shared_state_->sub_device_cq_owner.clear();
         cq_shared_state_->sub_device_cq_owner.resize(num_sub_devices);
         for (auto* device : mesh_device_->get_devices()) {
+            log_profiler_debug_x11_fd_clocks(
+                mesh_device_->impl().get_context_id(),
+                device,
+                "wait_for_completion_before_reset_read_ptr_enqueue",
+                id_,
+                reset_launch_msg_state);
             program_dispatch::reset_worker_dispatch_state_on_device(
                 mesh_device_,
                 device->sysmem_manager(),
                 id_,
                 this->virtual_program_dispatch_core(),
                 expected_num_workers_completed_,
+                reset_launch_msg_state);
+            log_profiler_debug_x11_fd_clocks(
+                mesh_device_->impl().get_context_id(),
+                device,
+                "wait_for_completion_after_reset_read_ptr_enqueue",
+                id_,
                 reset_launch_msg_state);
         }
         program_dispatch::reset_config_buf_mgrs_and_expected_workers(

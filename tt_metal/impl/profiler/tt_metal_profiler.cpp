@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -72,6 +73,45 @@
 namespace tt::tt_metal {
 
 namespace detail {
+
+bool profilerDebugX11Enabled() {
+    const char* value = std::getenv("TT_METAL_PROFILER_DEBUG_X11");
+    return value != nullptr && std::string_view(value) == "1";
+}
+
+bool profilerDebugX11Core(const CoreCoord& phys_core) {
+    return (phys_core.x == 6 || phys_core.x == 11 || phys_core.x == 12) &&
+           (phys_core.y == 2 || phys_core.y == 10 || phys_core.y == 11);
+}
+
+void logProfilerDebugX11CoreMapping(
+    const IDevice* device,
+    const CoreCoord& logical_core,
+    const CoreCoord& virtual_core,
+    const CoreType core_type,
+    const metal_SocDescriptor& soc_desc,
+    const std::unordered_map<CoreCoord, int32_t>& virtual_routing_to_flat_id) {
+    if (!profilerDebugX11Enabled()) {
+        return;
+    }
+    const CoreCoord phys_core = soc_desc.translate_coord_to(virtual_core, CoordSystem::TRANSLATED, CoordSystem::NOC0);
+    if (!profilerDebugX11Core(phys_core)) {
+        return;
+    }
+    const auto flat_id_it = virtual_routing_to_flat_id.find(virtual_core);
+    log_info(
+        tt::LogMetal,
+        "PROFILER_DEBUG_X11 map dev={} core_type={} logical=({},{}) virtual=({},{}) physical=({},{}) flat_id={}",
+        device->id(),
+        enchantum::to_string(core_type),
+        logical_core.x,
+        logical_core.y,
+        virtual_core.x,
+        virtual_core.y,
+        phys_core.x,
+        phys_core.y,
+        flat_id_it == virtual_routing_to_flat_id.end() ? -1 : flat_id_it->second);
+}
 
 void setControlBuffer(
     distributed::MeshDevice* mesh_device,
@@ -979,17 +1019,25 @@ std::vector<CoreCoord> getVirtualCoresForProfiling(const IDevice* device, const 
     const ChipId device_id = device->id();
     const uint8_t device_num_hw_cqs = device->num_hw_cqs();
     const auto& dispatch_core_config = get_dispatch_core_config();
+    ContextId context_id = extract_context_id(device);
+    const metal_SocDescriptor& soc_desc = MetalContext::instance(context_id).get_cluster().get_soc_desc(device_id);
+    const auto& virtual_routing_to_flat_id =
+        MetalContext::instance(context_id).get_cluster().get_virtual_routing_to_profiler_flat_id(device_id);
 
-    auto& env = MetalEnvAccessor(tt::tt_metal::MetalContext::instance(extract_context_id(device)).get_env()).impl();
+    auto& env = MetalEnvAccessor(tt::tt_metal::MetalContext::instance(context_id).get_env()).impl();
 
     if (!onlyProfileDispatchCores(state)) {
         for (const CoreCoord& core :
              tt::get_logical_compute_cores(env, device_id, device_num_hw_cqs, dispatch_core_config)) {
             const CoreCoord curr_core = device->worker_core_from_logical_core(core);
+            logProfilerDebugX11CoreMapping(
+                device, core, curr_core, CoreType::WORKER, soc_desc, virtual_routing_to_flat_id);
             virtual_cores.push_back(curr_core);
         }
         for (const CoreCoord& core : device->get_active_ethernet_cores(true)) {
             const CoreCoord curr_core = device->virtual_core_from_logical_core(core, CoreType::ETH);
+            logProfilerDebugX11CoreMapping(
+                device, core, curr_core, CoreType::ETH, soc_desc, virtual_routing_to_flat_id);
             virtual_cores.push_back(curr_core);
         }
     }
@@ -997,8 +1045,9 @@ std::vector<CoreCoord> getVirtualCoresForProfiling(const IDevice* device, const 
     if (env.get_rtoptions().get_profiler_do_dispatch_cores()) {
         for (const CoreCoord& core :
              tt::get_logical_dispatch_cores(env, device_id, device_num_hw_cqs, dispatch_core_config)) {
-            const CoreCoord curr_core =
-                device->virtual_core_from_logical_core(core, get_core_type_from_config(dispatch_core_config));
+            const CoreType core_type = get_core_type_from_config(dispatch_core_config);
+            const CoreCoord curr_core = device->virtual_core_from_logical_core(core, core_type);
+            logProfilerDebugX11CoreMapping(device, core, curr_core, core_type, soc_desc, virtual_routing_to_flat_id);
             virtual_cores.push_back(curr_core);
         }
     }

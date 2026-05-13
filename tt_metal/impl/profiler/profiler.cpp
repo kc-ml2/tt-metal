@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <string_view>
 
 #include <tt_stl/assert.hpp>
 #include "dispatch/kernels/cq_commands.hpp"
@@ -63,6 +64,26 @@
 namespace tt::tt_metal {
 
 namespace {
+bool profilerDebugX11Enabled() {
+    const char* value = std::getenv("TT_METAL_PROFILER_DEBUG_X11");
+    return value != nullptr && std::string_view(value) == "1";
+}
+
+bool profilerDebugX11Core(const CoreCoord& phys_core) {
+    return (phys_core.x == 6 || phys_core.x == 11 || phys_core.x == 12) &&
+           (phys_core.y == 2 || phys_core.y == 10 || phys_core.y == 11);
+}
+
+CoreCoord profilerDebugX11PhysicalCore(ContextId context_id, ChipId device_id, const CoreCoord& virtual_core) {
+    const metal_SocDescriptor& soc_desc = MetalContext::instance(context_id).get_cluster().get_soc_desc(device_id);
+    return soc_desc.translate_coord_to(virtual_core, CoordSystem::TRANSLATED, CoordSystem::NOC0);
+}
+
+bool profilerDebugX11ShouldLog(ContextId context_id, ChipId device_id, const CoreCoord& virtual_core) {
+    return profilerDebugX11Enabled() &&
+           profilerDebugX11Core(profilerDebugX11PhysicalCore(context_id, device_id, virtual_core));
+}
+
 kernel_profiler::PacketTypes get_packet_type(uint32_t timer_id) {
     return static_cast<kernel_profiler::PacketTypes>((timer_id >> 16) & 0x7);
 }
@@ -1355,6 +1376,33 @@ void DeviceProfiler::readControlBufferForCore(
                 .read_core(
                     device_id, virtual_core, control_vector_addr, kernel_profiler::PROFILER_L1_CONTROL_BUFFER_SIZE);
     }
+    if (profilerDebugX11ShouldLog(context_id, device_id, virtual_core)) {
+        const CoreCoord phys_core = profilerDebugX11PhysicalCore(context_id, device_id, virtual_core);
+        const std::vector<uint32_t>& control_buffer = core_control_buffers.at(virtual_core);
+        log_info(
+            tt::LogMetal,
+            "PROFILER_DEBUG_X11 control_read dev={} virtual=({},{}) physical=({},{}) core_type={} flat_id={} "
+            "core_count_per_dram={} host_end=[{},{},{},{},{}] dev_end=[{},{},{},{},{}] dropped=0x{:x}",
+            device_id,
+            virtual_core.x,
+            virtual_core.y,
+            phys_core.x,
+            phys_core.y,
+            enchantum::to_string(core_type),
+            control_buffer[kernel_profiler::FLAT_ID],
+            control_buffer[kernel_profiler::CORE_COUNT_PER_DRAM],
+            control_buffer[kernel_profiler::HOST_BUFFER_END_INDEX_BR_ER],
+            control_buffer[kernel_profiler::HOST_BUFFER_END_INDEX_NC],
+            control_buffer[kernel_profiler::HOST_BUFFER_END_INDEX_T0],
+            control_buffer[kernel_profiler::HOST_BUFFER_END_INDEX_T1],
+            control_buffer[kernel_profiler::HOST_BUFFER_END_INDEX_T2],
+            control_buffer[kernel_profiler::DEVICE_BUFFER_END_INDEX_BR_ER],
+            control_buffer[kernel_profiler::DEVICE_BUFFER_END_INDEX_NC],
+            control_buffer[kernel_profiler::DEVICE_BUFFER_END_INDEX_T0],
+            control_buffer[kernel_profiler::DEVICE_BUFFER_END_INDEX_T1],
+            control_buffer[kernel_profiler::DEVICE_BUFFER_END_INDEX_T2],
+            control_buffer[kernel_profiler::DROPPED_ZONES]);
+    }
 }
 
 void DeviceProfiler::readControlBuffers(
@@ -1392,6 +1440,31 @@ void DeviceProfiler::resetControlBuffers(
         core_control_buffer_reset[kernel_profiler::DRAM_PROFILER_ADDRESS_T1_0] = buffer_0_address;
         core_control_buffer_reset[kernel_profiler::DRAM_PROFILER_ADDRESS_T2_0] = buffer_0_address;
         this->active_dram_buffer_per_core_risc_map[virtual_core].clear();
+        if (profilerDebugX11ShouldLog(context_id, device_id, virtual_core)) {
+            const CoreCoord phys_core = profilerDebugX11PhysicalCore(context_id, device_id, virtual_core);
+            log_info(
+                tt::LogMetal,
+                "PROFILER_DEBUG_X11 control_reset dev={} virtual=({},{}) physical=({},{}) flat_id={} "
+                "keep_default=0x{:x} reset_dram_addr=0x{:x} old_host_end=[{},{},{},{},{}] old_dev_end=[{},{},{},{},{}]",
+                device_id,
+                virtual_core.x,
+                virtual_core.y,
+                phys_core.x,
+                phys_core.y,
+                core_control_buffer_reset[kernel_profiler::FLAT_ID],
+                core_control_buffer_reset[kernel_profiler::DRAM_PROFILER_ADDRESS_DEFAULT],
+                buffer_0_address,
+                control_buffer[kernel_profiler::HOST_BUFFER_END_INDEX_BR_ER],
+                control_buffer[kernel_profiler::HOST_BUFFER_END_INDEX_NC],
+                control_buffer[kernel_profiler::HOST_BUFFER_END_INDEX_T0],
+                control_buffer[kernel_profiler::HOST_BUFFER_END_INDEX_T1],
+                control_buffer[kernel_profiler::HOST_BUFFER_END_INDEX_T2],
+                control_buffer[kernel_profiler::DEVICE_BUFFER_END_INDEX_BR_ER],
+                control_buffer[kernel_profiler::DEVICE_BUFFER_END_INDEX_NC],
+                control_buffer[kernel_profiler::DEVICE_BUFFER_END_INDEX_T0],
+                control_buffer[kernel_profiler::DEVICE_BUFFER_END_INDEX_T1],
+                control_buffer[kernel_profiler::DEVICE_BUFFER_END_INDEX_T2]);
+        }
     }
 
     for (const auto& [virtual_core, control_buffer_reset] : core_control_buffer_resets) {
@@ -1473,6 +1546,7 @@ void DeviceProfiler::readRiscProfilerResults(
     // NOLINTBEGIN
     const CoreCoord phys_coord = soc_desc.translate_coord_to(worker_core, CoordSystem::TRANSLATED, CoordSystem::NOC0);
     // NOLINTEND
+    const bool debug_x11_core = profilerDebugX11Enabled() && profilerDebugX11Core(phys_coord);
     // helper function to lookup opname from runtime id if metadata is available
     auto getOpNameIfAvailable = [&metadata](auto device_id, auto runtime_id) {
         return (metadata.has_value()) ? metadata->get_op_name(device_id, runtime_id) : "";
@@ -1509,6 +1583,34 @@ void DeviceProfiler::readRiscProfilerResults(
             if (!riscs_to_include->contains(worker_core) || !riscs_to_include->at(worker_core).contains(riscType)) {
                 continue;
             }
+        }
+
+        if (debug_x11_core) {
+            log_info(
+                tt::LogMetal,
+                "PROFILER_DEBUG_X11 risc_scan dev={} source={} virtual=({},{}) physical=({},{}) risc={} "
+                "expected_flat_id={} buffer_end={} control_flat_id={} host_counter_slots=[{},{},{},{},{}] "
+                "device_counter_slots=[{},{},{},{},{}]",
+                device_id,
+                enchantum::to_string(data_source),
+                worker_core.x,
+                worker_core.y,
+                phys_coord.x,
+                phys_coord.y,
+                enchantum::to_string(riscType),
+                coreFlatID,
+                bufferEndIndex,
+                control_buffer[kernel_profiler::FLAT_ID],
+                control_buffer[kernel_profiler::HOST_BUFFER_END_INDEX_BR_ER],
+                control_buffer[kernel_profiler::HOST_BUFFER_END_INDEX_NC],
+                control_buffer[kernel_profiler::HOST_BUFFER_END_INDEX_T0],
+                control_buffer[kernel_profiler::HOST_BUFFER_END_INDEX_T1],
+                control_buffer[kernel_profiler::HOST_BUFFER_END_INDEX_T2],
+                control_buffer[kernel_profiler::DEVICE_BUFFER_END_INDEX_BR_ER],
+                control_buffer[kernel_profiler::DEVICE_BUFFER_END_INDEX_NC],
+                control_buffer[kernel_profiler::DEVICE_BUFFER_END_INDEX_T0],
+                control_buffer[kernel_profiler::DEVICE_BUFFER_END_INDEX_T1],
+                control_buffer[kernel_profiler::DEVICE_BUFFER_END_INDEX_T2]);
         }
 
         if (bufferEndIndex > 0) {
@@ -1555,6 +1657,16 @@ void DeviceProfiler::readRiscProfilerResults(
                 uint64_t data;  // only valid for TS_DATA
             };
             std::vector<PreSentinelMarker> pre_sentinel_markers;
+            bool sawTimestamp = false;
+            uint64_t firstTimestampRead = 0;
+            uint64_t lastTimestampRead = 0;
+            auto noteTimestampRead = [&](uint64_t timestamp) {
+                if (!sawTimestamp) {
+                    firstTimestampRead = timestamp;
+                    sawTimestamp = true;
+                }
+                lastTimestampRead = timestamp;
+            };
 
             for (int index = bufferRiscShift; index < (bufferRiscShift + bufferEndIndex);
                  index += kernel_profiler::PROFILER_L1_MARKER_UINT32_SIZE) {
@@ -1579,6 +1691,7 @@ void DeviceProfiler::readRiscProfilerResults(
                                 uint64_t data = (data_H << 32) | data_L;
                                 uint64_t timestamp = (static_cast<uint64_t>(time_H) << 32) | time_L;
                                 pre_sentinel_markers.push_back({timer_id, timestamp, data});
+                                noteTimestampRead(timestamp);
                             }
                             // Skip the data payload slot (4 slots total with the loop step).
                             index += kernel_profiler::PROFILER_L1_MARKER_UINT32_SIZE;
@@ -1655,6 +1768,8 @@ void DeviceProfiler::readRiscProfilerResults(
                                     runHostCounterRead,
                                     index);
 
+                                const uint64_t timestamp = (uint64_t(time_H) << 32) | time_L;
+                                noteTimestampRead(timestamp);
                                 readDeviceMarkerData(
                                     device_markers_for_core_risc,
                                     runHostCounterRead,
@@ -1665,7 +1780,7 @@ void DeviceProfiler::readRiscProfilerResults(
                                     riscType,
                                     0,
                                     timer_id,
-                                    (uint64_t(time_H) << 32) | time_L);
+                                    timestamp);
                             }
                         } break;
                         case kernel_profiler::ZONE_TOTAL: {
@@ -1673,6 +1788,8 @@ void DeviceProfiler::readRiscProfilerResults(
 
                             uint32_t time_H = opTime_H;
                             uint32_t time_L = opTime_L;
+                            const uint64_t timestamp = (uint64_t(time_H) << 32) | time_L;
+                            noteTimestampRead(timestamp);
                             readDeviceMarkerData(
                                 device_markers_for_core_risc,
                                 runHostCounterRead,
@@ -1683,7 +1800,7 @@ void DeviceProfiler::readRiscProfilerResults(
                                 riscType,
                                 sum,
                                 timer_id,
-                                (uint64_t(time_H) << 32) | time_L);
+                                timestamp);
                             break;
                         }
                         case kernel_profiler::TS_DATA: {
@@ -1694,6 +1811,51 @@ void DeviceProfiler::readRiscProfilerResults(
                             uint32_t data_L = data_buffer.at(index + 1);
                             uint64_t timestamp = (uint64_t(time_H) << 32) | time_L;
                             uint64_t data = (uint64_t(data_H) << 32) | data_L;
+                            noteTimestampRead(timestamp);
+
+                            if (debug_x11_core &&
+                                ((timer_id & 0xFFFF) == kernel_profiler::DEBUG_WALL_CLOCK_01_STATIC_ID ||
+                                 (timer_id & 0xFFFF) == kernel_profiler::DEBUG_WALL_CLOCK_1AT_STATIC_ID)) {
+                                if ((timer_id & 0xFFFF) == kernel_profiler::DEBUG_WALL_CLOCK_01_STATIC_ID) {
+                                    log_info(
+                                        tt::LogMetal,
+                                        "PROFILER_DEBUG_X11 wall_clock01 dev={} source={} virtual=({},{}) "
+                                        "physical=({},{}) risc={} marker_ts={} wall0_low=0x{:08x} wall1_raw=0x{:08x}",
+                                        device_id,
+                                        enchantum::to_string(data_source),
+                                        worker_core.x,
+                                        worker_core.y,
+                                        phys_coord.x,
+                                        phys_coord.y,
+                                        enchantum::to_string(riscType),
+                                        timestamp,
+                                        data_H,
+                                        data_L);
+                                } else {
+                                    const uint32_t encoded_x = (data_L >> 24) & 0xFF;
+                                    const uint32_t encoded_y = (data_L >> 16) & 0xFF;
+                                    const uint32_t encoded_flat_id = (data_L >> 8) & 0xFF;
+                                    const uint32_t encoded_risc = data_L & 0xFF;
+                                    log_info(
+                                        tt::LogMetal,
+                                        "PROFILER_DEBUG_X11 wall_clock1at dev={} source={} virtual=({},{}) "
+                                        "physical=({},{}) risc={} marker_ts={} wall1_at=0x{:08x} encoded_core=({},{}) "
+                                        "encoded_flat_id={} encoded_risc={}",
+                                        device_id,
+                                        enchantum::to_string(data_source),
+                                        worker_core.x,
+                                        worker_core.y,
+                                        phys_coord.x,
+                                        phys_coord.y,
+                                        enchantum::to_string(riscType),
+                                        timestamp,
+                                        data_H,
+                                        encoded_x,
+                                        encoded_y,
+                                        encoded_flat_id,
+                                        encoded_risc);
+                                }
+                            }
 
                             readDeviceMarkerData(
                                 device_markers_for_core_risc,
@@ -1711,6 +1873,8 @@ void DeviceProfiler::readRiscProfilerResults(
                         case kernel_profiler::TS_EVENT: {
                             uint32_t time_H = data_buffer.at(index) & 0xFFF;
                             uint32_t time_L = data_buffer.at(index + 1);
+                            const uint64_t timestamp = (uint64_t(time_H) << 32) | time_L;
+                            noteTimestampRead(timestamp);
                             readDeviceMarkerData(
                                 device_markers_for_core_risc,
                                 runHostCounterRead,
@@ -1721,7 +1885,7 @@ void DeviceProfiler::readRiscProfilerResults(
                                 riscType,
                                 0,
                                 timer_id,
-                                (uint64_t(time_H) << 32) | time_L);
+                                timestamp);
                             break;
                         }
                         case kernel_profiler::TS_DATA_16B: {
@@ -1742,6 +1906,7 @@ void DeviceProfiler::readRiscProfilerResults(
                             uint64_t timestamp = (uint64_t(time_H) << 32) | time_L;
                             uint64_t data = (uint64_t(data_H) << 32) | data_L;
                             uint64_t trailer = (uint64_t(trailer_H) << 32) | trailer_L;
+                            noteTimestampRead(timestamp);
 
                             readTsData16BMarkerData(
                                 device_markers_for_core_risc,
@@ -1763,6 +1928,27 @@ void DeviceProfiler::readRiscProfilerResults(
                         }
                     }
                 }
+            }
+            if (debug_x11_core) {
+                log_info(
+                    tt::LogMetal,
+                    "PROFILER_DEBUG_X11 risc_result dev={} source={} virtual=({},{}) physical=({},{}) risc={} "
+                    "expected_flat_id={} coreFlatIDRead={} runHostCounterRead={} first_ts={} last_ts={} "
+                    "buffer_shift={} buffer_end={}",
+                    device_id,
+                    enchantum::to_string(data_source),
+                    worker_core.x,
+                    worker_core.y,
+                    phys_coord.x,
+                    phys_coord.y,
+                    enchantum::to_string(riscType),
+                    coreFlatID,
+                    coreFlatIDRead,
+                    runHostCounterRead,
+                    firstTimestampRead,
+                    lastTimestampRead,
+                    bufferRiscShift,
+                    bufferEndIndex);
             }
         }
     }

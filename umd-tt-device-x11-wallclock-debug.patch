@@ -1,0 +1,180 @@
+diff --git a/device/tt_device/tt_device.cpp b/device/tt_device/tt_device.cpp
+index 1ad51c0d..ee769d06 100644
+--- a/device/tt_device/tt_device.cpp
++++ b/device/tt_device/tt_device.cpp
+@@ -8,9 +8,11 @@
+ 
+ #include <chrono>
+ #include <cstddef>
++#include <cstdlib>
+ #include <cstdint>
+ #include <memory>
+ #include <mutex>
++#include <string_view>
+ #include <thread>
+ #include <tt-logger/tt-logger.hpp>
+ #include <utility>
+@@ -49,6 +51,102 @@
+ namespace tt::umd {
+ enum class RiscType : std::uint64_t;
+ 
++namespace {
++
++bool profiler_debug_x11_enabled() {
++    const char* value = std::getenv("TT_METAL_PROFILER_DEBUG_X11");
++    return value != nullptr && std::string_view(value) == "1";
++}
++
++bool profiler_debug_x11_translated_core(tt_xy_pair core) {
++    return (core.x == 6 || core.x == 7 || core.x == 10) && (core.y == 2 || core.y == 10 || core.y == 11);
++}
++
++void log_profiler_debug_x11_reset_regs(
++    TTDevice& device,
++    tt_xy_pair core,
++    std::string_view phase,
++    uint32_t current_state,
++    uint32_t update_state,
++    uint32_t target_state) {
++    if (!profiler_debug_x11_enabled() || device.get_arch() != tt::ARCH::BLACKHOLE ||
++        !profiler_debug_x11_translated_core(core)) {
++        return;
++    }
++
++    constexpr uint64_t soft_reset_addr = 0xFFB121B0;
++    constexpr uint64_t wall_clock_0_addr = 0xFFB121F0;
++    constexpr uint64_t wall_clock_1_addr = 0xFFB121F4;
++    constexpr uint64_t wall_clock_1_at_addr = 0xFFB121F8;
++    uint32_t soft_reset_readback = 0;
++    uint32_t wall0 = 0;
++    uint32_t wall1 = 0;
++    uint32_t wall1_at = 0;
++
++    device.read_from_device(&soft_reset_readback, core, soft_reset_addr, sizeof(soft_reset_readback));
++    device.read_from_device(&wall0, core, wall_clock_0_addr, sizeof(wall0));
++    device.read_from_device(&wall1, core, wall_clock_1_addr, sizeof(wall1));
++    device.read_from_device(&wall1_at, core, wall_clock_1_at_addr, sizeof(wall1_at));
++
++    log_info(
++        tt::LogDevice,
++        "PROFILER_DEBUG_X11 umd_reset_clock phase={} translated=({},{}) current=0x{:08x} update=0x{:08x} target=0x{:08x} soft_reset_readback=0x{:08x} wall0_low=0x{:08x} wall1_raw=0x{:08x} wall1_at=0x{:08x}",
++        phase,
++        core.x,
++        core.y,
++        current_state,
++        update_state,
++        target_state,
++        soft_reset_readback,
++        wall0,
++        wall1,
++        wall1_at);
++}
++
++void log_profiler_debug_x11_physical_sample_cores(TTDevice& device, std::string_view phase) {
++    if (!profiler_debug_x11_enabled() || device.get_arch() != tt::ARCH::BLACKHOLE) {
++        return;
++    }
++
++    constexpr uint64_t soft_reset_addr = 0xFFB121B0;
++    constexpr uint64_t wall_clock_0_addr = 0xFFB121F0;
++    constexpr uint64_t wall_clock_1_addr = 0xFFB121F4;
++    constexpr uint64_t wall_clock_1_at_addr = 0xFFB121F8;
++
++    for (uint32_t y : {2u, 10u, 11u}) {
++        for (const auto& [translated_x, physical_x] :
++             {std::pair<uint32_t, uint32_t>{6u, 6u},
++              std::pair<uint32_t, uint32_t>{7u, 11u},
++              std::pair<uint32_t, uint32_t>{10u, 12u}}) {
++            tt_xy_pair translated_core(translated_x, y);
++            uint32_t soft_reset_readback = 0;
++            uint32_t wall0 = 0;
++            uint32_t wall1 = 0;
++            uint32_t wall1_at = 0;
++            device.read_from_device(
++                &soft_reset_readback, translated_core, soft_reset_addr, sizeof(soft_reset_readback));
++            device.read_from_device(&wall0, translated_core, wall_clock_0_addr, sizeof(wall0));
++            device.read_from_device(&wall1, translated_core, wall_clock_1_addr, sizeof(wall1));
++            device.read_from_device(&wall1_at, translated_core, wall_clock_1_at_addr, sizeof(wall1_at));
++            log_info(
++                tt::LogDevice,
++                "PROFILER_DEBUG_X11 umd_open_clock phase={} device_id={} translated=({},{}) physical=({},{}) soft_reset_readback=0x{:08x} wall0_low=0x{:08x} wall1_raw=0x{:08x} wall1_at=0x{:08x}",
++                phase,
++                device.get_communication_device_id(),
++                translated_x,
++                y,
++                physical_x,
++                y,
++                soft_reset_readback,
++                wall0,
++                wall1,
++                wall1_at);
++        }
++    }
++}
++
++}  // namespace
++
+ /* static */ void TTDevice::set_sigbus_safe_handler(bool set_safe_handler) {
+     SiliconTlbWindow::set_sigbus_safe_handler(set_safe_handler);
+ }
+@@ -108,6 +206,7 @@ void TTDevice::probe_arc() {
+ 
+ void TTDevice::init_tt_device(const std::chrono::milliseconds timeout_ms, const std::string &soc_descriptor_path) {
+     ZoneScopedC(tracy::Color::DarkGreen);
++    log_profiler_debug_x11_physical_sample_cores(*this, "init_tt_device_entry");
+     if (pcie_capabilities_ != nullptr) {
+         is_pcie_hung();
+     }
+@@ -122,6 +221,7 @@ void TTDevice::init_tt_device(const std::chrono::milliseconds timeout_ms, const
+     telemetry = ArcTelemetryReader::create_arc_telemetry_reader(this);
+     firmware_info_provider = FirmwareInfoProvider::create_firmware_info_provider(this);
+     construct_soc_descriptor(soc_descriptor_path);
++    log_profiler_debug_x11_physical_sample_cores(*this, "init_tt_device_after_soc_descriptor");
+ }
+ 
+ /* static */ std::unique_ptr<TTDevice> TTDevice::create(
+@@ -144,10 +244,16 @@ void TTDevice::init_tt_device(const std::chrono::milliseconds timeout_ms, const
+     auto pci_device = std::make_unique<PCIDevice>(device_number);
+ 
+     switch (pci_device->get_arch()) {
+-        case ARCH::WORMHOLE_B0:
+-            return std::unique_ptr<WormholeTTDevice>(new WormholeTTDevice(std::move(pci_device), use_safe_api));
+-        case ARCH::BLACKHOLE:
+-            return std::unique_ptr<BlackholeTTDevice>(new BlackholeTTDevice(std::move(pci_device), use_safe_api));
++        case ARCH::WORMHOLE_B0: {
++            auto device = std::unique_ptr<WormholeTTDevice>(new WormholeTTDevice(std::move(pci_device), use_safe_api));
++            log_profiler_debug_x11_physical_sample_cores(*device, "tt_device_create_after_open");
++            return device;
++        }
++        case ARCH::BLACKHOLE: {
++            auto device = std::unique_ptr<BlackholeTTDevice>(new BlackholeTTDevice(std::move(pci_device), use_safe_api));
++            log_profiler_debug_x11_physical_sample_cores(*device, "tt_device_create_after_open");
++            return device;
++        }
+         default:
+             return nullptr;
+     }
+@@ -441,7 +547,11 @@ void TTDevice::assert_risc_reset(tt_xy_pair core, const RiscType selected_riscs)
+     uint32_t soft_reset_current_state = get_risc_reset_state(core);
+     uint32_t soft_reset_update = architecture_impl_->get_soft_reset_reg_value(selected_riscs);
+     uint32_t soft_reset_new = soft_reset_current_state | soft_reset_update;
++    log_profiler_debug_x11_reset_regs(
++        *this, core, "before_assert", soft_reset_current_state, soft_reset_update, soft_reset_new);
+     set_risc_reset_state(core, soft_reset_new);
++    log_profiler_debug_x11_reset_regs(
++        *this, core, "after_assert", soft_reset_current_state, soft_reset_update, soft_reset_new);
+ }
+ 
+ void TTDevice::deassert_risc_reset(tt_xy_pair core, const RiscType selected_riscs, bool staggered_start) {
+@@ -450,7 +560,11 @@ void TTDevice::deassert_risc_reset(tt_xy_pair core, const RiscType selected_risc
+     uint32_t soft_reset_new = soft_reset_current_state & ~soft_reset_update;
+     uint32_t soft_reset_new_with_staggered_start =
+         soft_reset_new | (staggered_start ? architecture_impl_->get_soft_reset_staggered_start() : 0);
++    log_profiler_debug_x11_reset_regs(
++        *this, core, "before_deassert", soft_reset_current_state, soft_reset_update, soft_reset_new_with_staggered_start);
+     set_risc_reset_state(core, soft_reset_new_with_staggered_start);
++    log_profiler_debug_x11_reset_regs(
++        *this, core, "after_deassert", soft_reset_current_state, soft_reset_update, soft_reset_new_with_staggered_start);
+ }
+ 
+ tt_xy_pair TTDevice::get_arc_core() const { return arc_core; }

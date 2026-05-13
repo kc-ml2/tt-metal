@@ -101,6 +101,66 @@ inline bool is_watcher_assert_enabled() {
            !tt::tt_metal::MetalContext::instance().rtoptions().watcher_assert_disabled();
 }
 
+bool profiler_debug_x11_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("TT_METAL_PROFILER_DEBUG_X11");
+        return value != nullptr && std::string_view(value) != "0";
+    }();
+    return enabled;
+}
+
+void log_profiler_debug_x11_dispatch_clocks(
+    IDevice* device, std::string_view phase, uint8_t cq_id, bool reset_launch_msg_state) {
+    if (!profiler_debug_x11_enabled()) {
+        return;
+    }
+
+    static constexpr uint64_t wall_clock_0_addr = 0xFFB121F0;
+    static constexpr uint64_t wall_clock_1_addr = 0xFFB121F4;
+    static constexpr uint64_t wall_clock_1_at_addr = 0xFFB121F8;
+    static constexpr std::array<CoreCoord, 9> suspect_virtual_cores = {
+        CoreCoord{6, 2},
+        CoreCoord{7, 2},
+        CoreCoord{10, 2},
+        CoreCoord{6, 10},
+        CoreCoord{7, 10},
+        CoreCoord{10, 10},
+        CoreCoord{6, 11},
+        CoreCoord{7, 11},
+        CoreCoord{10, 11},
+    };
+
+    auto& cluster = MetalContext::instance().get_cluster();
+    const ChipId device_id = device->id();
+    const auto& virtual_worker_cores = cluster.get_virtual_worker_cores(device_id);
+    for (const CoreCoord& virtual_core : suspect_virtual_cores) {
+        if (!virtual_worker_cores.contains(virtual_core)) {
+            continue;
+        }
+
+        uint32_t wall0 = 0;
+        uint32_t wall1 = 0;
+        uint32_t wall1_at = 0;
+        cluster.read_reg(&wall0, tt_cxy_pair(device_id, virtual_core), wall_clock_0_addr);
+        cluster.read_reg(&wall1, tt_cxy_pair(device_id, virtual_core), wall_clock_1_addr);
+        cluster.read_reg(&wall1_at, tt_cxy_pair(device_id, virtual_core), wall_clock_1_at_addr);
+
+        log_info(
+            LogMetal,
+            "PROFILER_DEBUG_X11 dispatch_reset_clock phase={} device={} cq={} reset_launch={} translated=({}, {}) "
+            "wall0=0x{:08x} wall1=0x{:08x} wall1_at=0x{:08x}",
+            phase,
+            device_id,
+            cq_id,
+            reset_launch_msg_state,
+            virtual_core.x,
+            virtual_core.y,
+            wall0,
+            wall1,
+            wall1_at);
+    }
+}
+
 struct CommandConstants {
     CoreType dispatch_core_type;
     NOC noc_index;
@@ -2896,6 +2956,7 @@ void reset_worker_dispatch_state_on_device(
     CoreCoord dispatch_core,
     const DispatchArray<uint32_t>& expected_num_workers_completed,
     bool reset_launch_msg_state) {
+    log_profiler_debug_x11_dispatch_clocks(device, "reset_worker_dispatch_state_entry", cq_id, reset_launch_msg_state);
     auto num_sub_devices = device->num_sub_devices();
 
     tt::tt_metal::DeviceCommandCalculator calculator;
@@ -2972,6 +3033,8 @@ void reset_worker_dispatch_state_on_device(
     manager.issue_queue_push_back(cmd_sequence_sizeB, cq_id);
     manager.fetch_queue_reserve_back(cq_id);
     manager.fetch_queue_write(cmd_sequence_sizeB, cq_id);
+    log_profiler_debug_x11_dispatch_clocks(
+        device, "reset_worker_dispatch_state_after_fetch_queue_write", cq_id, reset_launch_msg_state);
 }
 
 void set_num_worker_sems_on_dispatch(
